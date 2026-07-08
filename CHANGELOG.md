@@ -8,4 +8,5 @@
   highlighted in the designer.
 - Saved model state after gizmo edits, visibility changes, texture toggles,
   scale resets, mesh toggles, and mesh deletes.
-- Added README usage examples as GIFs showing the reference-model designer workflow.
+- Added README usage examples as GIFs showing the reference-model designer
+  workflow, mesh highlighting, and restored state.

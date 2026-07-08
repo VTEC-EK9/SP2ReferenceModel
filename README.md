@@ -25,5 +25,9 @@ Use the reference model while refining a craft in the designer:
 
 ![Using a reference model in the designer](docs/media/usage-designer-example.gif)
 
+Preview mesh-row hover highlighting and restored reference-model state:
+
+![Highlighting and restoring reference-model state](docs/media/usage-hover-and-state.gif)
+
 Build with `dotnet build -c Release`; the DLL is copied to `BepInEx\plugins`
 automatically (fails silently if the game is running — copy manually then).

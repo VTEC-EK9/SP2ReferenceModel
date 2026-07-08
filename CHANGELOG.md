@@ -12,3 +12,7 @@
   workflow, mesh highlighting, restored state, and model-specific session restore.
 - Expanded README installation and source-build instructions to match the other
   SP2 plugin docs.
+- Fixed OBJ axis conversion by negating X, reversing triangle winding, and
+  replacing the old Y/Z swap with an explicit `SourceIsZUp` option.
+- Made the OBJ file picker asynchronous so folder navigation in the native
+  dialog cannot freeze the game while the picker is open.

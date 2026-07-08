@@ -13,7 +13,7 @@ namespace SP2ReferenceModel
     internal sealed class RuntimeObjLoader
     {
         private readonly ManualLogSource _log;
-        private readonly bool _swapYz;
+        private readonly bool _zUpSource;
         private readonly List<Vector3> _positions = new List<Vector3>();
         private readonly List<Vector2> _uvs = new List<Vector2>();
         private readonly List<Vector3> _normals = new List<Vector3>();
@@ -26,10 +26,10 @@ namespace SP2ReferenceModel
         public readonly List<GameObject> MeshObjects = new List<GameObject>();
         public int VertexCount { get; private set; }
 
-        public RuntimeObjLoader(ManualLogSource log, bool swapYz)
+        public RuntimeObjLoader(ManualLogSource log, bool zUpSource)
         {
             _log = log;
-            _swapYz = swapYz;
+            _zUpSource = zUpSource;
         }
 
         public GameObject Load(string path)
@@ -113,19 +113,13 @@ namespace SP2ReferenceModel
             if (tokens.Length < 3) return;
             ObjIndex[] face = tokens.Select(ParseIndex).ToArray();
             List<ObjIndex> target = _group.GetTriangles(_materialName);
+            // The right-to-left-handed conversion mirrors an axis, so winding
+            // must always be reversed to keep faces front-facing.
             for (int i = 1; i < face.Length - 1; i++)
             {
                 target.Add(face[0]);
-                if (_swapYz)
-                {
-                    target.Add(face[i + 1]);
-                    target.Add(face[i]);
-                }
-                else
-                {
-                    target.Add(face[i]);
-                    target.Add(face[i + 1]);
-                }
+                target.Add(face[i + 1]);
+                target.Add(face[i]);
             }
         }
 
@@ -322,11 +316,14 @@ namespace SP2ReferenceModel
             }
         }
 
+        // OBJ is right-handed, Unity is left-handed: negate X (like Unity's own
+        // importers) and reverse winding. Z-up sources additionally get the
+        // proper -90° X rotation (y,z) -> (z,-y), NOT a plain y/z swap (that is
+        // a mirror that pitches the model onto its nose).
         private Vector3 ParseVector3(string value, bool position)
         {
             Vector3 v = ParseVector3Raw(value);
-            if (!_swapYz) return v;
-            return position ? new Vector3(v.x, v.z, v.y) : new Vector3(v.x, v.z, v.y);
+            return _zUpSource ? new Vector3(-v.x, v.z, -v.y) : new Vector3(-v.x, v.y, v.z);
         }
 
         private static Vector3 ParseVector3Raw(string value)

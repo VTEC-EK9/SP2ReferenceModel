@@ -31,7 +31,7 @@ namespace SP2ReferenceModel
 
         private ConfigEntry<string> _modelPath;
         private ConfigEntry<float> _scale;
-        private ConfigEntry<bool> _swapYz;
+        private ConfigEntry<bool> _zUpSource;
         private ConfigEntry<bool> _autoLoad;
         private ConfigEntry<bool> _showTextures;
 
@@ -47,6 +47,10 @@ namespace SP2ReferenceModel
         private string _loadedModelPath;
         private readonly List<string> _deletedNames = new List<string>();
         private bool _restoringState;
+
+        private volatile bool _pickerActive;
+        private volatile bool _pickerDone;
+        private string _pickerResult;
 
         private DesignerTools _hookedTools;
         private bool _editingModel;
@@ -147,8 +151,9 @@ namespace SP2ReferenceModel
                 "Absolute path to the OBJ reference model.");
             _scale = Config.Bind("Model", "Scale", 1f,
                 "Reference model scale. GameModels3D OBJ exports are normally meter-scaled.");
-            _swapYz = Config.Bind("Model", "SwapYAndZ", true,
-                "Convert common Z-up OBJ coordinates to Unity Y-up coordinates.");
+            _zUpSource = Config.Bind("Model", "SourceIsZUp", false,
+                "Rotate Z-up OBJ exports (e.g. raw Blender axes) to Unity Y-up. " +
+                "Most OBJ files (including GameModels3D exports) are already Y-up - leave this off.");
             _autoLoad = Config.Bind("Model", "AutoLoad", false,
                 "Load the configured OBJ automatically when the designer opens.");
             _showTextures = Config.Bind("Model", "ShowTextures", false,
@@ -164,6 +169,7 @@ namespace SP2ReferenceModel
 
         private void Update()
         {
+            ConsumePickerResult();
             Designer designer = Designer.Instance;
             if (designer == null)
             {
@@ -708,18 +714,23 @@ namespace SP2ReferenceModel
             if (_panelVisible) RefreshLabels();
         }
 
+        // Native Win32 file picker on a dedicated STA thread (Ookii is bundled
+        // with the game). The main thread must NOT block on the dialog: a
+        // blocked main thread stops the game window from pumping messages, and
+        // shell extensions invoked by folder navigation (thumbnails, cloud
+        // overlays) can SendMessage to that hung window and deadlock the
+        // dialog. The result is consumed in Update via ConsumePickerResult.
         private void OpenObjFromDisk()
         {
-            string path = PickObjFile();
-            if (!string.IsNullOrEmpty(path)) LoadModel(path);
-        }
-
-        // Native Win32 file picker on a dedicated STA thread (Ookii is bundled with the game).
-        private string PickObjFile()
-        {
-            string result = null;
+            if (_pickerActive) return;
+            _pickerActive = true;
+            SetStatus("Choose an OBJ in the file dialog...");
+            string initial = File.Exists(_modelPath.Value)
+                ? Path.GetDirectoryName(_modelPath.Value)
+                : ModelDirectory;
             Thread thread = new Thread(delegate ()
             {
+                string result = null;
                 try
                 {
                     VistaOpenFileDialog dialog = new VistaOpenFileDialog
@@ -729,9 +740,6 @@ namespace SP2ReferenceModel
                         Multiselect = false,
                         CheckFileExists = true
                     };
-                    string initial = File.Exists(_modelPath.Value)
-                        ? Path.GetDirectoryName(_modelPath.Value)
-                        : ModelDirectory;
                     if (Directory.Exists(initial)) dialog.InitialDirectory = initial;
                     if (dialog.ShowDialog() == WinForms.DialogResult.OK) result = dialog.FileName;
                 }
@@ -739,12 +747,24 @@ namespace SP2ReferenceModel
                 {
                     Logger.LogWarning("File picker failed: " + ex.Message);
                 }
+                _pickerResult = result;
+                _pickerDone = true;
             });
             thread.SetApartmentState(ApartmentState.STA);
             thread.IsBackground = true;
             thread.Start();
-            thread.Join();
-            return result;
+        }
+
+        private void ConsumePickerResult()
+        {
+            if (!_pickerDone) return;
+            _pickerDone = false;
+            _pickerActive = false;
+            string picked = _pickerResult;
+            _pickerResult = null;
+            if (Designer.Instance == null) return;
+            if (!string.IsNullOrEmpty(picked)) LoadModel(picked);
+            else SetStatus(_root != null ? "File selection canceled" : "No model loaded");
         }
 
         private void ReloadModel()
@@ -778,7 +798,7 @@ namespace SP2ReferenceModel
 
         private void ToggleSwapYz()
         {
-            _swapYz.Value = !_swapYz.Value;
+            _zUpSource.Value = !_zUpSource.Value;
             Config.Save();
             SetStatus("Axis conversion changed; Reload to apply");
             RefreshLabels();
@@ -833,7 +853,7 @@ namespace SP2ReferenceModel
                 _visibilityLabel.text = _root == null ? "Model: not loaded" : "Model visible: " + (_modelVisible ? "ON" : "OFF");
             if (_texturesLabel != null)
                 _texturesLabel.text = "Textures: " + (_showTextures.Value ? "ON" : "OFF (plain white)");
-            if (_swapLabel != null) _swapLabel.text = "Swap Y/Z: " + (_swapYz.Value ? "ON" : "OFF") + " (reload after change)";
+            if (_swapLabel != null) _swapLabel.text = "Z-up source: " + (_zUpSource.Value ? "ON" : "OFF") + " (reload after change)";
             if (_autoLoadLabel != null) _autoLoadLabel.text = "Auto-load: " + (_autoLoad.Value ? "ON" : "OFF");
             RefreshMeshRows();
         }
@@ -1006,7 +1026,7 @@ namespace SP2ReferenceModel
                 if (!File.Exists(path)) throw new FileNotFoundException("OBJ not found", path);
                 SetStatus("Loading " + Path.GetFileName(path) + " ...");
                 UnloadModel(false);
-                RuntimeObjLoader loader = new RuntimeObjLoader(Logger, _swapYz.Value);
+                RuntimeObjLoader loader = new RuntimeObjLoader(Logger, _zUpSource.Value);
                 _root = loader.Load(path);
                 _root.name = "SP2 Reference - " + Path.GetFileNameWithoutExtension(path);
                 _root.transform.position = Vector3.zero;

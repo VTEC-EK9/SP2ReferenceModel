@@ -3,7 +3,10 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
+using System.Xml.Linq;
 using Assets.Scripts.Design;
 using Assets.Scripts.Design.Tools;
 using BepInEx;
@@ -12,6 +15,7 @@ using Ookii.Dialogs;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
+using UnityEngine.Rendering;
 using UnityEngine.UI;
 using WinForms = System.Windows.Forms;
 
@@ -22,7 +26,7 @@ namespace SP2ReferenceModel
     {
         public const string PluginGuid = "codex.sp2.referencemodel";
         public const string PluginName = "SP2 Reference Model";
-        public const string PluginVersion = "0.5.0";
+        public const string PluginVersion = "0.7.0";
         private const string MenuButtonTitle = "OPEN .OBJ";
 
         private ConfigEntry<string> _modelPath;
@@ -40,6 +44,9 @@ namespace SP2ReferenceModel
         private string _status = "No model loaded";
         private bool _modelVisible = true;
         private bool _triedAutoLoad;
+        private string _loadedModelPath;
+        private readonly List<string> _deletedNames = new List<string>();
+        private bool _restoringState;
 
         private DesignerTools _hookedTools;
         private bool _editingModel;
@@ -71,12 +78,50 @@ namespace SP2ReferenceModel
         private TextMeshProUGUI _meshWindowTitle;
         private TMP_InputField _meshFilterInput;
         private readonly List<MeshRow> _meshRows = new List<MeshRow>();
+        private Material _outlineMaterial;
+        private GameObject _hoverOutline;
+        private GameObject _hoverTarget;
 
         private sealed class MeshRow
         {
             public GameObject RowObject;
             public GameObject Mesh;
             public TextMeshProUGUI Label;
+        }
+
+        // uGUI enter/exit events run on the whole parent chain of the hovered
+        // object, so one handler on the row covers its name/Move/delete buttons.
+        private sealed class RowHoverHandler : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
+        {
+            public Action<bool> HoverChanged;
+
+            public void OnPointerEnter(PointerEventData eventData) => HoverChanged?.Invoke(true);
+            public void OnPointerExit(PointerEventData eventData) => HoverChanged?.Invoke(false);
+            private void OnDisable() => HoverChanged?.Invoke(false);
+        }
+
+        // Keeps the outline shell glued to its piece (pieces can be gizmo-moved
+        // while hovered) by mirroring the piece's local pose, inflated about the
+        // mesh bounds center.
+        private sealed class OutlineFollower : MonoBehaviour
+        {
+            public Transform Target;
+            public Vector3 BoundsCenter;
+            public Vector3 Inflate;
+
+            private void LateUpdate()
+            {
+                if (Target == null)
+                {
+                    gameObject.SetActive(false);
+                    return;
+                }
+                transform.localRotation = Target.localRotation;
+                transform.localScale = Vector3.Scale(Target.localScale, Inflate);
+                Vector3 shift = BoundsCenter - Vector3.Scale(Inflate, BoundsCenter);
+                transform.localPosition = Target.localPosition +
+                    Target.localRotation * Vector3.Scale(Target.localScale, shift);
+            }
         }
 
         private sealed class WindowDragHandle : MonoBehaviour, IDragHandler
@@ -93,6 +138,7 @@ namespace SP2ReferenceModel
         }
 
         private string ModelDirectory => Path.Combine(Paths.ConfigPath, "SP2ReferenceModel", "Models");
+        private string StateDirectory => Path.Combine(Paths.ConfigPath, "SP2ReferenceModel", "State");
 
         private void Awake()
         {
@@ -109,6 +155,11 @@ namespace SP2ReferenceModel
                 "Render the MTL colors and textures. When off the model is plain white.");
             Logger.LogInfo(PluginName + " " + PluginVersion +
                            " loaded. Controls are injected into the designer main menu.");
+        }
+
+        private void OnDestroy()
+        {
+            SaveModelState();
         }
 
         private void Update()
@@ -193,7 +244,14 @@ namespace SP2ReferenceModel
 
         private void ArmGizmoTool(TransformTool tool)
         {
-            tool.SetExternalTarget(_editTarget, null, null, null, _editTarget);
+            tool.SetExternalTarget(_editTarget, null, OnGizmoEditDone, null, _editTarget);
+        }
+
+        // Fires on Done/Cancel and on tool switches; the pose is final either
+        // way (Cancel restores the original pose before the callback).
+        private void OnGizmoEditDone(bool applied)
+        {
+            SaveModelState();
         }
 
         private void StartEdit(Transform target)
@@ -463,6 +521,10 @@ namespace SP2ReferenceModel
                 GameObject captured = meshObject;
 
                 GameObject rowObject = MakeRow("MeshRow", _meshRowsParent, 26f);
+                Image rowImage = rowObject.AddComponent<Image>();
+                rowImage.color = new Color(0f, 0f, 0f, 0f);
+                RowHoverHandler hover = rowObject.AddComponent<RowHoverHandler>();
+                hover.HoverChanged = hovered => SetMeshHoverHighlight(captured, hovered);
                 GameObject nameButton = AddActionButton(_templateButton, rowObject.transform, "", 220f,
                     () => ToggleMesh(captured));
                 LayoutElement nameElement = nameButton.GetComponent<LayoutElement>();
@@ -522,6 +584,7 @@ namespace SP2ReferenceModel
             if (meshObject == null) return;
             meshObject.SetActive(!meshObject.activeSelf);
             RefreshMeshRows();
+            SaveModelState();
         }
 
         private void SetAllMeshesActive(bool active)
@@ -529,6 +592,7 @@ namespace SP2ReferenceModel
             foreach (GameObject meshObject in _meshObjects)
                 if (meshObject != null) meshObject.SetActive(active);
             RefreshMeshRows();
+            SaveModelState();
         }
 
         private void ResetPieceTransforms()
@@ -539,12 +603,84 @@ namespace SP2ReferenceModel
                 meshObject.transform.localPosition = Vector3.zero;
                 meshObject.transform.localRotation = Quaternion.identity;
             }
+            SaveModelState();
+        }
+
+        // Hover highlight: a duplicate of the piece's mesh rendered as a
+        // front-culled unlit yellow shell, slightly inflated about the mesh
+        // bounds so it reads as an outline (like the native part selection).
+        private void SetMeshHoverHighlight(GameObject meshObject, bool hovered)
+        {
+            if (!hovered)
+            {
+                if (meshObject == null || _hoverTarget == meshObject) ClearHoverOutline();
+                return;
+            }
+            if (meshObject == null || _root == null)
+            {
+                ClearHoverOutline();
+                return;
+            }
+            if (_hoverTarget == meshObject && _hoverOutline != null) return;
+            ClearHoverOutline();
+
+            MeshFilter filter = meshObject.GetComponent<MeshFilter>();
+            if (filter == null || filter.sharedMesh == null) return;
+            Mesh mesh = filter.sharedMesh;
+            EnsureOutlineMaterial();
+
+            _hoverOutline = new GameObject("ReferenceHoverOutline") { hideFlags = HideFlags.DontSave };
+            _hoverOutline.transform.SetParent(meshObject.transform.parent, false);
+            _hoverOutline.AddComponent<MeshFilter>().sharedMesh = mesh;
+            MeshRenderer renderer = _hoverOutline.AddComponent<MeshRenderer>();
+            Material[] materials = new Material[mesh.subMeshCount];
+            for (int i = 0; i < materials.Length; i++) materials[i] = _outlineMaterial;
+            renderer.sharedMaterials = materials;
+            renderer.shadowCastingMode = ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+
+            // Constant world-space thickness: grow each axis by ~2% of the
+            // largest extent, so thin pieces (wings, panels) still get a rim.
+            Bounds bounds = mesh.bounds;
+            float thickness = Mathf.Max(bounds.extents.x, bounds.extents.y, bounds.extents.z) * 0.02f;
+            Vector3 inflate = new Vector3(
+                1f + thickness / Mathf.Max(bounds.extents.x, 1e-5f),
+                1f + thickness / Mathf.Max(bounds.extents.y, 1e-5f),
+                1f + thickness / Mathf.Max(bounds.extents.z, 1e-5f));
+
+            OutlineFollower follower = _hoverOutline.AddComponent<OutlineFollower>();
+            follower.Target = meshObject.transform;
+            follower.BoundsCenter = bounds.center;
+            follower.Inflate = inflate;
+            _hoverTarget = meshObject;
+        }
+
+        private void ClearHoverOutline()
+        {
+            if (_hoverOutline != null) Destroy(_hoverOutline);
+            _hoverOutline = null;
+            _hoverTarget = null;
+        }
+
+        private void EnsureOutlineMaterial()
+        {
+            if (_outlineMaterial != null) return;
+            Shader shader = Shader.Find("Universal Render Pipeline/Unlit") ??
+                            Shader.Find("Unlit/Color") ??
+                            Shader.Find("Universal Render Pipeline/Lit");
+            _outlineMaterial = new Material(shader) { name = "ReferenceHoverOutline", hideFlags = HideFlags.DontSave };
+            Color highlight = new Color(1f, 0.76f, 0.12f, 1f);
+            if (_outlineMaterial.HasProperty("_BaseColor")) _outlineMaterial.SetColor("_BaseColor", highlight);
+            if (_outlineMaterial.HasProperty("_Color")) _outlineMaterial.SetColor("_Color", highlight);
+            if (_outlineMaterial.HasProperty("_Cull")) _outlineMaterial.SetFloat("_Cull", (float)CullMode.Front);
         }
 
         private void DeleteMesh(GameObject meshObject)
         {
             if (meshObject == null) return;
+            if (_hoverTarget == meshObject) ClearHoverOutline();
             if (_editingModel && _editTarget == meshObject.transform) EndModelEdit();
+            if (!_deletedNames.Contains(meshObject.name)) _deletedNames.Add(meshObject.name);
             foreach (MeshFilter filter in meshObject.GetComponentsInChildren<MeshFilter>(true))
                 if (filter.sharedMesh != null) Destroy(filter.sharedMesh);
             foreach (MeshRenderer renderer in meshObject.GetComponentsInChildren<MeshRenderer>(true))
@@ -558,6 +694,7 @@ namespace SP2ReferenceModel
                 _meshRows.RemoveAt(i);
             }
             RefreshMeshRows();
+            SaveModelState();
         }
 
         // ------------------------------------------------------------------
@@ -628,6 +765,7 @@ namespace SP2ReferenceModel
             _modelVisible = !_modelVisible;
             _root.SetActive(_modelVisible);
             RefreshLabels();
+            SaveModelState();
         }
 
         private void ToggleTextures()
@@ -664,6 +802,7 @@ namespace SP2ReferenceModel
             if (_scaleInput != null)
                 _scaleInput.SetTextWithoutNotify(FormatNumber(_scale.Value));
             RefreshLabels();
+            SaveModelState();
         }
 
         private void ResetTransform()
@@ -676,6 +815,7 @@ namespace SP2ReferenceModel
             ApplyScale();
             if (_scaleInput != null) _scaleInput.SetTextWithoutNotify(FormatNumber(_scale.Value));
             RefreshLabels();
+            SaveModelState();
         }
 
         private void RefreshLabels()
@@ -696,6 +836,162 @@ namespace SP2ReferenceModel
             if (_swapLabel != null) _swapLabel.text = "Swap Y/Z: " + (_swapYz.Value ? "ON" : "OFF") + " (reload after change)";
             if (_autoLoadLabel != null) _autoLoadLabel.text = "Auto-load: " + (_autoLoad.Value ? "ON" : "OFF");
             RefreshMeshRows();
+        }
+
+        // ------------------------------------------------------------------
+        // Session state (root pose, scale, per-piece visibility/pose, deletes)
+        // ------------------------------------------------------------------
+
+        private static string StateFileNameFor(string modelPath)
+        {
+            string full = Path.GetFullPath(modelPath);
+            using (MD5 md5 = MD5.Create())
+            {
+                byte[] hash = md5.ComputeHash(Encoding.UTF8.GetBytes(full.ToLowerInvariant()));
+                StringBuilder hex = new StringBuilder(8);
+                for (int i = 0; i < 4; i++) hex.Append(hash[i].ToString("x2"));
+                return Path.GetFileNameWithoutExtension(full) + "_" + hex + ".xml";
+            }
+        }
+
+        private static string Num(float value)
+        {
+            return value.ToString("R", CultureInfo.InvariantCulture);
+        }
+
+        private static float ReadFloat(XElement element, string name, float fallback)
+        {
+            XAttribute attribute = element.Attribute(name);
+            return attribute != null &&
+                   float.TryParse(attribute.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out float value)
+                ? value
+                : fallback;
+        }
+
+        private static object[] PoseAttributes(Transform transform)
+        {
+            Vector3 p = transform.localPosition;
+            Quaternion q = transform.localRotation;
+            return new object[]
+            {
+                new XAttribute("px", Num(p.x)), new XAttribute("py", Num(p.y)), new XAttribute("pz", Num(p.z)),
+                new XAttribute("qx", Num(q.x)), new XAttribute("qy", Num(q.y)),
+                new XAttribute("qz", Num(q.z)), new XAttribute("qw", Num(q.w))
+            };
+        }
+
+        private static void ApplyPose(Transform transform, XElement element)
+        {
+            transform.localPosition = new Vector3(
+                ReadFloat(element, "px", transform.localPosition.x),
+                ReadFloat(element, "py", transform.localPosition.y),
+                ReadFloat(element, "pz", transform.localPosition.z));
+            Quaternion q = new Quaternion(
+                ReadFloat(element, "qx", 0f), ReadFloat(element, "qy", 0f),
+                ReadFloat(element, "qz", 0f), ReadFloat(element, "qw", 1f));
+            if (Mathf.Abs(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w - 1f) < 0.1f)
+                transform.localRotation = q;
+        }
+
+        private void SaveModelState()
+        {
+            if (_restoringState || _root == null || string.IsNullOrEmpty(_loadedModelPath)) return;
+            try
+            {
+                XElement xml = new XElement("ReferenceModelState",
+                    new XAttribute("path", _loadedModelPath),
+                    new XAttribute("visible", _modelVisible),
+                    new XAttribute("scale", Num(_scale.Value)),
+                    PoseAttributes(_root.transform));
+                foreach (GameObject meshObject in _meshObjects)
+                {
+                    if (meshObject == null) continue;
+                    XElement piece = new XElement("Piece",
+                        new XAttribute("name", meshObject.name),
+                        new XAttribute("active", meshObject.activeSelf));
+                    piece.Add(PoseAttributes(meshObject.transform));
+                    xml.Add(piece);
+                }
+                foreach (string name in _deletedNames)
+                    xml.Add(new XElement("Deleted", new XAttribute("name", name)));
+                Directory.CreateDirectory(StateDirectory);
+                xml.Save(Path.Combine(StateDirectory, StateFileNameFor(_loadedModelPath)));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("Could not save reference model state: " + ex.Message);
+            }
+        }
+
+        private bool RestoreModelState(string modelPath)
+        {
+            string file;
+            try
+            {
+                file = Path.Combine(StateDirectory, StateFileNameFor(modelPath));
+                if (!File.Exists(file)) return false;
+            }
+            catch
+            {
+                return false;
+            }
+
+            try
+            {
+                XElement xml = XElement.Load(file);
+                _restoringState = true;
+                try
+                {
+                    ApplyPose(_root.transform, xml);
+                    float scale = ReadFloat(xml, "scale", _scale.Value);
+                    if (scale > 0f && !float.IsNaN(scale) && !float.IsInfinity(scale))
+                    {
+                        _scale.Value = scale;
+                        Config.Save();
+                        ApplyScale();
+                    }
+                    XAttribute visible = xml.Attribute("visible");
+                    if (visible != null && bool.TryParse(visible.Value, out bool isVisible))
+                    {
+                        _modelVisible = isVisible;
+                        _root.SetActive(_modelVisible);
+                    }
+
+                    Dictionary<string, GameObject> byName =
+                        new Dictionary<string, GameObject>(StringComparer.OrdinalIgnoreCase);
+                    foreach (GameObject meshObject in _meshObjects)
+                        if (meshObject != null && !byName.ContainsKey(meshObject.name))
+                            byName[meshObject.name] = meshObject;
+
+                    foreach (XElement piece in xml.Elements("Piece"))
+                    {
+                        string name = (string)piece.Attribute("name");
+                        if (name == null || !byName.TryGetValue(name, out GameObject meshObject) || meshObject == null)
+                            continue;
+                        XAttribute active = piece.Attribute("active");
+                        if (active != null && bool.TryParse(active.Value, out bool isActive))
+                            meshObject.SetActive(isActive);
+                        ApplyPose(meshObject.transform, piece);
+                    }
+                    foreach (XElement deleted in xml.Elements("Deleted"))
+                    {
+                        string name = (string)deleted.Attribute("name");
+                        if (name != null && byName.TryGetValue(name, out GameObject meshObject) && meshObject != null)
+                            DeleteMesh(meshObject);
+                    }
+                }
+                finally
+                {
+                    _restoringState = false;
+                }
+                if (_scaleInput != null) _scaleInput.SetTextWithoutNotify(FormatNumber(_scale.Value));
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("Could not restore reference model state: " + ex.Message);
+                return false;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -737,8 +1033,11 @@ namespace SP2ReferenceModel
                 _modelVisible = true;
                 _modelPath.Value = path;
                 Config.Save();
-                SetStatus("Loaded " + _meshObjects.Count + " meshes, " +
-                          loader.VertexCount.ToString("N0", CultureInfo.InvariantCulture) + " vertices");
+                _loadedModelPath = path;
+                bool restored = RestoreModelState(path);
+                SetStatus("Loaded " + _meshObjects.Count(m => m != null) + " meshes, " +
+                          loader.VertexCount.ToString("N0", CultureInfo.InvariantCulture) + " vertices" +
+                          (restored ? "; session restored" : ""));
                 Logger.LogInfo(_status + " from " + path);
                 if (_meshWindow != null && _meshWindow.activeSelf) RebuildMeshRows();
             }
@@ -786,7 +1085,9 @@ namespace SP2ReferenceModel
 
         private void UnloadModel(bool updateStatus = true)
         {
+            SaveModelState();
             EndModelEdit();
+            ClearHoverOutline();
             if (_root != null)
             {
                 foreach (MeshFilter filter in _root.GetComponentsInChildren<MeshFilter>(true))
@@ -796,6 +1097,8 @@ namespace SP2ReferenceModel
                 Destroy(_root);
             }
             _root = null;
+            _loadedModelPath = null;
+            _deletedNames.Clear();
             _ownedResources.Clear();
             _texturedMaterials.Clear();
             _meshObjects.Clear();

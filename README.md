@@ -25,7 +25,7 @@ Use the reference model while refining a craft in the designer:
 
 ![Using a reference model in the designer](docs/media/usage-designer-example.gif)
 
-Preview mesh-row hover highlighting and restored reference-model state:
+Edit and translate orientation of mesh submodules:
 
 ![Highlighting and restoring reference-model state](docs/media/usage-hover-and-state.gif)
 

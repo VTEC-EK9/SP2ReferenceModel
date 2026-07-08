@@ -10,3 +10,5 @@
   scale resets, mesh toggles, and mesh deletes.
 - Added README usage examples as GIFs showing the reference-model designer
   workflow, mesh highlighting, restored state, and model-specific session restore.
+- Expanded README installation and source-build instructions to match the other
+  SP2 plugin docs.

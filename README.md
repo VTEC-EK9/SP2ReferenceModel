@@ -33,5 +33,49 @@ Restore a saved session for a particular model:
 
 ![Restoring a saved session for a particular model](docs/media/usage-restore-specific-model.gif)
 
-Build with `dotnet build -c Release`; the DLL is copied to `BepInEx\plugins`
-automatically (fails silently if the game is running — copy manually then).
+## Installation
+
+1. Install BepInEx 5.x for the 64-bit Windows version of SimplePlanes 2.
+2. Run the game once so BepInEx creates its folders.
+3. Copy `SP2ReferenceModel.dll` into:
+
+```text
+SimplePlanes 2\BepInEx\plugins\
+```
+
+4. Restart SimplePlanes 2.
+5. Check `BepInEx\LogOutput.log` if **3D Reference Model** does not appear in
+   the designer main menu.
+
+## Building from source
+
+The project targets .NET Framework 4.8 and references assemblies from the
+installed game and BepInEx.
+
+By default, the project expects SimplePlanes 2 at:
+
+```text
+C:\Program Files (x86)\Steam\steamapps\common\SimplePlanes 2
+```
+
+Build a release DLL with:
+
+```powershell
+dotnet build .\SP2ReferenceModel.csproj -c Release
+```
+
+The compiled plugin is written to:
+
+```text
+bin\Release\SP2ReferenceModel.dll
+```
+
+The build also attempts to copy `SP2ReferenceModel.dll` into
+`SimplePlanes 2\BepInEx\plugins\`. If the game is running and the copy fails,
+copy the DLL manually.
+
+To build against a different installation directory:
+
+```powershell
+dotnet build .\SP2ReferenceModel.csproj -c Release -p:GameDir="D:\Path\To\SimplePlanes 2"
+```

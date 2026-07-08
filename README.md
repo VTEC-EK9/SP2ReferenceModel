@@ -14,5 +14,16 @@ colors and textures on. The model is visual-only, is not added to craft XML,
 has no colliders, and disappears outside the designer. Named OBJ objects/groups
 become individually toggleable mesh entries in paged native controls.
 
+## Usage examples
+
+Load an OBJ reference model, then move and rotate it with the in-game designer
+gizmos:
+
+![Loading and positioning a reference model](docs/media/usage-load-and-position.gif)
+
+Use the reference model while refining a craft in the designer:
+
+![Using a reference model in the designer](docs/media/usage-designer-example.gif)
+
 Build with `dotnet build -c Release`; the DLL is copied to `BepInEx\plugins`
 automatically (fails silently if the game is running — copy manually then).

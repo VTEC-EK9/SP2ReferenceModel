@@ -29,5 +29,9 @@ Edit and translate orientation of mesh submodules:
 
 ![Highlighting and restoring reference-model state](docs/media/usage-hover-and-state.gif)
 
+Restore a saved session for a particular model:
+
+![Restoring a saved session for a particular model](docs/media/usage-restore-specific-model.gif)
+
 Build with `dotnet build -c Release`; the DLL is copied to `BepInEx\plugins`
 automatically (fails silently if the game is running — copy manually then).
